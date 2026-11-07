@@ -1,0 +1,1 @@
+A connected-mode PR merge claims live on GitHub: the claim's amended merge passes the push gates, and the parallel PR canary runs end to end, positive and negative scenarios, on a public throwaway.

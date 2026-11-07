@@ -1,0 +1,140 @@
+name: bootstrap-ci
+
+# Bootstrap workflow that owns every CI setup mutation for a v4rian repo.
+#
+# Trigger is workflow_dispatch only. The laptop-side bin/bootstrap-ci is a
+# thin wrapper that validates the operator's role, captures the operator's
+# gh session token, and dispatches this workflow via gh workflow run with
+# the token passed as the admin_token input. No bootstrap work happens on
+# the laptop.
+#
+# Auth model: every gh api call below runs under inputs.admin_token, which
+# carries the operator's own gh session token transiently into this single
+# run. The token has the same authority the operator has on their laptop
+# (admin scope on the target repo), so ruleset POSTs, branch protection
+# PUTs, and other admin operations succeed. The token is not stored as a
+# repo secret; it lives only inside this run's event payload. For v4rian
+# org-private repos this is the chosen path over stored PATs or a GitHub
+# App.
+#
+# Inputs:
+#   mode         apply | check | dry-run
+#   admin_token  operator gh session token, transient, used only by this run
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'apply | check | dry-run'
+        required: false
+        type: choice
+        options:
+          - apply
+          - check
+          - dry-run
+        default: apply
+      admin_token:
+        description: 'Operator gh session token; transient, used only by this run'
+        required: true
+        type: string
+      claude_token:
+        description: 'Optional CLAUDE_CODE_OAUTH_TOKEN (from `claude setup-token`); when provided, step 9b sets the repo Actions secret so claude-judgment audits run armed. Minting stays human; the setting becomes self-contained.'
+        required: false
+        type: string
+
+concurrency:
+  group: bootstrap-ci
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  bootstrap:
+    name: Bootstrap repo CI (rules, required checks, merge defaults, topics)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ inputs.admin_token }}
+      TOKEN: ${{ inputs.admin_token }}
+      GITHUB_TOKEN: ${{ inputs.admin_token }}
+      OWNER_REPO: ${{ github.repository }}
+      REPO_ROOT: ${{ github.workspace }}
+      NS_DIR: .io.v4rian.how-git
+      MODE: ${{ inputs.mode }}
+      CLAUDE_TOKEN_INPUT: ${{ inputs.claude_token }}
+      TOKEN_SRC: 'operator gh session (workflow_dispatch input)'
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Install Claude Code on the runner so step_claude_setup sees a
+      # claude binary in part one of its probe. The pinned version
+      # matches ci-dispatch.yml's inline install step. ubuntu-latest
+      # does not ship claude per the runner-images manifest, so the
+      # explicit install is required.
+      - name: Install Claude Code
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLAUDE_CODE_VERSION="2.1.150"
+          echo "Installing Claude Code v${CLAUDE_CODE_VERSION}..."
+          for attempt in 1 2 3; do
+            if curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_CODE_VERSION"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "Failed to install Claude Code after 3 attempts" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          PATH="$HOME/.local/bin:$PATH" command -v claude || { echo "claude not on PATH after install" >&2; exit 1; }
+          PATH="$HOME/.local/bin:$PATH" claude --version
+
+      - name: step_actions_enabled
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" actions_enabled
+
+      - name: step_workflows_enabled
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" workflows_enabled
+
+      - name: step_seed_dev
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" seed_dev
+
+      # step_apply_rules shells out to apply-repo-rules.sh per the
+      # delegation pattern the prior bin/bootstrap-ci used. The script
+      # owns the 422 soft-skip handlers for the GITHUB_TOKEN admin-scope
+      # gap (Name must be unique).
+      - name: step_apply_rules
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" apply_rules
+
+      - name: step_required_checks
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" required_checks
+
+      - name: step_merge_commit_defaults
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" merge_commit_defaults
+
+      - name: step_merge_mode_lock
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" merge_mode_lock
+
+      - name: step_disable_auto_delete
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" disable_auto_delete
+
+      - name: step_topics
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" topics
+
+      - name: step_claude_setup
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" claude_setup
+
+      - name: step_consumer_cleanup
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" consumer_cleanup
+
+      - name: step_report
+        run: bash "$REPO_ROOT/$NS_DIR/scripts/bootstrap-ci-steps.sh" report
